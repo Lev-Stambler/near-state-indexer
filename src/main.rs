@@ -2,7 +2,7 @@ use clap::Parser;
 use std::convert::TryFrom;
 use std::env;
 
-use borsh::BorshSerialize;
+use borsh::{self, BorshDeserialize, BorshSerialize};
 use futures::StreamExt;
 use redis::aio::Connection;
 use redis::AsyncCommands;
@@ -14,6 +14,7 @@ use crate::configs::{Opts, SubCommand};
 use near_indexer::near_primitives;
 use near_primitives::account::Account;
 use near_primitives::views::StateChangeValueView;
+use near_sdk::{AccountId, Balance};
 
 mod configs;
 #[macro_use]
@@ -21,6 +22,25 @@ mod retriable;
 
 // Categories for logging
 const INDEXER_FOR_EXPLORER: &str = "indexer_for_explorer";
+
+#[derive(BorshDeserialize, BorshSerialize, Debug)]
+struct Message {
+    pub body: String,
+    pub topic: String,
+    pub owner: String,
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Debug)]
+struct Contract {
+    owner: String,
+    fee_amount: u128,
+    accrued_fees: u128,
+    nonce: u128,
+    message: Option<Message>,
+}
+
+#[derive(BorshDeserialize, BorshSerialize)]
+struct ContractWrapper(pub Contract);
 
 async fn get_redis_connection() -> anyhow::Result<Connection> {
     let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
@@ -37,7 +57,14 @@ async fn handle_message(streamer_message: near_indexer::StreamerMessage, _strict
     for state_change in streamer_message.state_changes {
         match state_change.value {
             StateChangeValueView::DataUpdate { account_id, key, value } => {
-                println!("DataUpdate {}", account_id);
+                // TODO: j check the proper account ID and ignore otherwise
+                // A ghetto way of extracting the private field
+                let v_serial = BorshSerialize::try_to_vec(&value)?;
+                
+                let inner_vec: Vec<u8> = BorshDeserialize::try_from_slice(&v_serial)?;
+                let contract_state: Contract = BorshDeserialize::try_from_slice(&inner_vec)?;
+
+                println!("DataUpdate {} {:?}, {:?}", account_id, key, contract_state);
                 let redis_key = [account_id.as_ref().as_bytes(), b":", key.as_ref()].concat();
                 redis_connection
                     .zadd([b"data:", redis_key.as_slice()].concat(), block_hash.as_ref(), block_height)
@@ -73,7 +100,7 @@ async fn handle_message(streamer_message: near_indexer::StreamerMessage, _strict
                     .await?;
             }
             StateChangeValueView::AccountUpdate { account_id, account } => {
-                println!("AccountUpdate {}", account_id);
+                println!("AccountUpdate {}, {}", account_id, account.amount);
                 let redis_key = account_id.as_ref().as_bytes();
                 redis_connection
                     .zadd([b"account:", redis_key].concat(), block_hash.as_ref(), block_height)
